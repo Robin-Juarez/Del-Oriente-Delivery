@@ -6,6 +6,7 @@ import re
 import math
 import hashlib
 import io
+import concurrent.futures
 import pdfplumber
 from datetime import datetime, timedelta
 import zoneinfo
@@ -105,6 +106,26 @@ st.session_state.gps_piloto = {'lat': c_lat, 'lon': c_lon}
 tiempo_entrega_min = st.sidebar.slider("Minutos promedio por entrega", min_value=1, max_value=20, value=5)
 velocidad_promedio_kmh = st.sidebar.slider("Velocidad promedio (km/h)", min_value=10, max_value=60, value=25)
 
+# --- GEOCODIFICACIÓN: Google (recomendado) con respaldo gratuito en OSM ---
+# OpenStreetMap/Nominatim (gratis) casi nunca tiene indexado el número de casa
+# de direcciones guatemaltecas ("9 avenida 25-67 zona 12"): como mucho ubica
+# la Zona como área genérica. Google sí tiene ese nivel de detalle mapeado en
+# Guatemala. Si el piloto/dueño de la app agrega su API key aquí, se usa
+# Google (rápido y preciso); si la deja vacía, sigue funcionando gratis con
+# OpenStreetMap, pero con menor precisión y más lento.
+st.sidebar.markdown("---")
+st.sidebar.subheader("🌍 Geocodificación")
+google_api_key = st.sidebar.text_input(
+    "Google Maps API Key (opcional)",
+    type="password",
+    help=(
+        "Con una API key de Google Geocoding, las direcciones se ubican con "
+        "mucha más precisión en Guatemala y en paralelo (carga rápida). "
+        "Sin ella, se usa OpenStreetMap gratis: más lento y menos preciso "
+        "para direcciones exactas de avenida/zona."
+    )
+)
+
 
 def formatear_telefono_gt(telefono_raw):
     digitos = re.sub(r'\D', '', str(telefono_raw))
@@ -143,6 +164,41 @@ def geocodificar_rapido(direccion_raw):
         pass
 
     return 14.5950, -90.5120, False
+
+
+@st.cache_data(show_spinner=False)
+def geocodificar_google(direccion_raw, api_key):
+    """
+    Geocodificador alterno con la API de Google. A diferencia de Nominatim,
+    Google sí tiene bien indexado el sistema de direcciones de Guatemala
+    (avenida/calle + número de casa + zona/colonia), y soporta muchas
+    solicitudes simultáneas sin política de 1 req/seg, por lo que se puede
+    paralelizar para que la carga sea rápida.
+    """
+    query = f"{direccion_raw}, Ciudad de Guatemala, Guatemala"
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": query, "key": api_key, "region": "gt"},
+            timeout=5
+        ).json()
+        if resp.get("status") == "OK" and resp.get("results"):
+            loc = resp["results"][0]["geometry"]["location"]
+            return loc["lat"], loc["lng"], True
+    except Exception:
+        pass
+    return 14.5950, -90.5120, False
+
+
+def geocodificar_direccion(direccion_raw, api_key=None):
+    """
+    Punto único de geocodificación usado por el resto de la app: usa Google
+    si hay API key configurada (rápido y preciso para Guatemala); si no, cae
+    al Nominatim/OSM gratuito ya existente (más lento, cobertura limitada).
+    """
+    if api_key:
+        return geocodificar_google(direccion_raw, api_key)
+    return geocodificar_rapido(direccion_raw)
 
 
 def calcular_matriz_distancias_haversine(puntos):
@@ -431,9 +487,44 @@ if st.session_state.puntos_cargados:
                 'lon': st.session_state.gps_piloto['lon']
             }]
 
+            # OPTIMIZACIÓN DE VELOCIDAD: se geocodifica cada dirección ÚNICA solo
+            # una vez (en tu archivo de prueba, 14 paquetes son en realidad solo
+            # 4 direcciones distintas), en vez de repetir la misma consulta por
+            # cada paquete. Con Google además se hace en paralelo.
+            direcciones_unicas = list({pkt['direccion'] for pkt in st.session_state.puntos_cargados})
+            resultados_geo = {}
+            barra_geo = st.progress(0.0, text="Ubicando direcciones...")
+
+            if google_api_key:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    futuros = {
+                        executor.submit(geocodificar_direccion, d, google_api_key): d
+                        for d in direcciones_unicas
+                    }
+                    completados = 0
+                    for fut in concurrent.futures.as_completed(futuros):
+                        d = futuros[fut]
+                        resultados_geo[d] = fut.result()
+                        completados += 1
+                        barra_geo.progress(
+                            completados / len(direcciones_unicas),
+                            text=f"Ubicando direcciones... ({completados}/{len(direcciones_unicas)})"
+                        )
+            else:
+                # Nominatim exige máx. 1 solicitud/seg: aquí debe ir secuencial,
+                # o el servicio gratuito puede bloquear la IP a mitad de proceso.
+                for i, d in enumerate(direcciones_unicas):
+                    resultados_geo[d] = geocodificar_direccion(d, None)
+                    barra_geo.progress(
+                        (i + 1) / len(direcciones_unicas),
+                        text=f"Ubicando direcciones... ({i + 1}/{len(direcciones_unicas)})"
+                    )
+
+            barra_geo.empty()
+
             fallidas = []
             for pkt in st.session_state.puntos_cargados:
-                lat, lon, encontrado = geocodificar_rapido(pkt['direccion'])
+                lat, lon, encontrado = resultados_geo[pkt['direccion']]
                 if not encontrado:
                     fallidas.append(f"{pkt['nombre']} — {pkt['direccion']}")
                 puntos_completos.append({
