@@ -20,11 +20,11 @@ hora_gt_actual = datetime.now(TZ_GT)
 
 st.title("🚚 Del Oriente Delivery - Control de Piloto")
 
-# Reloj con la hora actual de Guatemala
+# Reloj en tiempo real con la hora local de Guatemala
 st.markdown(f"### 🕒 Hora local en Guatemala: **{hora_gt_actual.strftime('%I:%M:%S %p')}**")
 
 OSRM_URL = "http://router.project-osrm.org/table/v1/driving"
-geolocator = Nominatim(user_agent="del_oriente_delivery_gt_v3", timeout=3)
+geolocator = Nominatim(user_agent="del_oriente_delivery_gt_v4", timeout=3)
 
 # --- ESTADOS DE SESIÓN ---
 if 'puntos_cargados' not in st.session_state:
@@ -73,11 +73,9 @@ velocidad_promedio_kmh = st.sidebar.slider("Velocidad promedio (km/h)", min_valu
 def formatear_telefono_gt(telefono_raw):
     digitos = re.sub(r'\D', '', str(telefono_raw))
     
-    # Remover 502 si viene duplicado al inicio
     if digitos.startswith('502') and len(digitos) > 8:
         digitos = digitos[3:]
         
-    # Obtener los últimos 8 dígitos válidos
     if len(digitos) >= 8:
         d8 = digitos[-8:]
         return f"+502 {d8[:4]}-{d8[4:]}", f"+502{d8}"
@@ -280,7 +278,6 @@ if st.session_state.secuencia_optima and st.session_state.puntos_ruta:
     minutos_entregas = num_paquetes * tiempo_entrega_min
     minutos_totales = minutos_manejo + minutos_entregas
     
-    # Hora estimada de finalización basada en el momento de carga exacta de Guatemala
     hora_estimada_fin = datetime.now(TZ_GT) + timedelta(minutes=minutos_totales)
     
     m1, m2, m3, m4 = st.columns(4)
@@ -291,81 +288,131 @@ if st.session_state.secuencia_optima and st.session_state.puntos_ruta:
 
     st.markdown("---")
     
-    col_lista, col_mapa = st.columns([1, 1])
+    # --- PESTAÑAS: RUTA ACTIVA VS HISTORIAL ---
+    tab_activa, tab_historial = st.tabs(["🚚 Ruta Activa", "📋 Historial y Reportes"])
     
-    with col_lista:
-        st.subheader("📋 Estado de Entregas y Gestión de Llamadas")
-        for paso, idx in enumerate(st.session_state.secuencia_optima):
-            pt = st.session_state.puntos_ruta[idx]
-            
-            if paso == 0:
-                st.markdown(f"🚩 **Inicio (GPS Piloto):** Lat {pt['lat']}, Lon {pt['lon']}")
-                if len(st.session_state.distancias_pasos) > 0:
-                    d_m = st.session_state.distancias_pasos[0]
-                    st.caption(f"➡️ Distancia a primera entrega: **{d_m/1000:.2f} km** ({d_m:,.0f} m)")
-                st.markdown("---")
-            else:
-                pkt_id = pt['id']
-                estado_actual = st.session_state.estados_paquetes.get(pkt_id, "Pendiente ⏳")
-                
-                gmaps_url = f"https://www.google.com/maps/search/?api=1&query={pt['lat']},{pt['lon']}"
-                
-                st.markdown(f"**Parada {paso:02d}:** [{pt['warehouse']}] **{pt['nombre']}**")
-                st.markdown(f"📍 {pt['direccion']}")
-                st.markdown(f"📞 Teléfono: **{pt['telefono_fmt']}**")
-                st.markdown(f"**Estado Actual:** `{estado_actual}`")
-                
-                # Botón de llamada telefónica directa
-                st.markdown(f'<a href="tel:{pt["telefono_clean"]}" style="text-decoration:none;"><button style="background-color:#25D366;color:white;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;font-weight:bold;">📞 Llamar al Cliente ({pt["telefono_fmt"]})</button></a>', unsafe_allow_html=True)
-                
-                # Botones de cambio de estado
-                b1, b2, b3 = st.columns(3)
-                if b1.button("✅ Entregado", key=f"ent_{pkt_id}"):
-                    st.session_state.estados_paquetes[pkt_id] = "Entregado ✅"
-                    st.rerun()
-                if b2.button("👤 Ausente", key=f"aus_{pkt_id}"):
-                    st.session_state.estados_paquetes[pkt_id] = "Ausente 👤"
-                    st.rerun()
-                if b3.button("❌ No Entregado", key=f"noe_{pkt_id}"):
-                    st.session_state.estados_paquetes[pkt_id] = "No Entregado ❌"
-                    st.rerun()
-                
-                if paso < len(st.session_state.distancias_pasos):
-                    d_next_m = st.session_state.distancias_pasos[paso]
-                    st.info(f"📏 Distancia al siguiente paquete: **{d_next_m/1000:.2f} km** ({d_next_m:,.0f} m)")
-                
-                st.markdown(f"[🗺️ Navegar en Google Maps]({gmaps_url})")
-                st.markdown("---")
-                
-    with col_mapa:
-        st.subheader("🗺️ Mapa de la Ruta y Estados")
-        puntos = st.session_state.puntos_ruta
-        m = folium.Map(location=[puntos[0]['lat'], puntos[0]['lon']], zoom_start=13)
+    with tab_activa:
+        col_lista, col_mapa = st.columns([1, 1])
         
-        coords_ruta = []
-        for paso, idx in enumerate(st.session_state.secuencia_optima):
-            pt = puntos[idx]
-            coords_ruta.append([pt['lat'], pt['lon']])
+        with col_lista:
+            st.subheader("📋 Entregas Pendientes")
             
-            if paso == 0:
-                color = "green"
-            else:
-                est = st.session_state.estados_paquetes.get(pt['id'], "Pendiente ⏳")
-                if "Entregado ✅" in est:
-                    color = "blue"
-                elif "Ausente 👤" in est:
-                    color = "orange"
-                elif "No Entregado ❌" in est:
-                    color = "red"
+            # Filtrar solo paquetes con estado 'Pendiente'
+            paquetes_pendientes = 0
+            
+            for paso, idx in enumerate(st.session_state.secuencia_optima):
+                pt = st.session_state.puntos_ruta[idx]
+                
+                if paso == 0:
+                    st.markdown(f"🚩 **Inicio (GPS Piloto):** Lat {pt['lat']}, Lon {pt['lon']}")
+                    if len(st.session_state.distancias_pasos) > 0:
+                        d_m = st.session_state.distancias_pasos[0]
+                        st.caption(f"➡️ Distancia a primera entrega: **{d_m/1000:.2f} km** ({d_m:,.0f} m)")
+                    st.markdown("---")
                 else:
-                    color = "purple"
-
-            folium.Marker(
-                [pt['lat'], pt['lon']], 
-                popup=f"Parada {paso}: {pt['nombre']}<br>Tel: {pt['telefono_fmt']}<br>Estado: {st.session_state.estados_paquetes.get(pt.get('id'), 'Inicio')}",
-                tooltip=f"Parada {paso}: [{pt['warehouse']}]",
-                icon=folium.Icon(color=color, icon="info-sign")
-            ).add_to(m)
+                    pkt_id = pt['id']
+                    estado_actual = st.session_state.estados_paquetes.get(pkt_id, "Pendiente ⏳")
+                    
+                    # Solo mostrar si está pendiente
+                    if estado_actual == "Pendiente ⏳":
+                        paquetes_pendientes += 1
+                        gmaps_url = f"https://www.google.com/maps/search/?api=1&query={pt['lat']},{pt['lon']}"
+                        
+                        st.markdown(f"**Parada {paso:02d}:** [{pt['warehouse']}] **{pt['nombre']}**")
+                        st.markdown(f"📍 {pt['direccion']}")
+                        st.markdown(f"📞 Teléfono: **{pt['telefono_fmt']}**")
+                        
+                        # Botón de llamada telefónica directa
+                        st.markdown(f'<a href="tel:{pt["telefono_clean"]}" style="text-decoration:none;"><button style="background-color:#25D366;color:white;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;font-weight:bold;">📞 Llamar al Cliente ({pt["telefono_fmt"]})</button></a>', unsafe_allow_html=True)
+                        
+                        # Botones para marcar estado
+                        b1, b2, b3 = st.columns(3)
+                        if b1.button("✅ Entregado", key=f"ent_{pkt_id}"):
+                            st.session_state.estados_paquetes[pkt_id] = "Entregado ✅"
+                            st.rerun()
+                        if b2.button("👤 Ausente", key=f"aus_{pkt_id}"):
+                            st.session_state.estados_paquetes[pkt_id] = "Ausente 👤"
+                            st.rerun()
+                        if b3.button("❌ No Entregado", key=f"noe_{pkt_id}"):
+                            st.session_state.estados_paquetes[pkt_id] = "No Entregado ❌"
+                            st.rerun()
+                        
+                        if paso < len(st.session_state.distancias_pasos):
+                            d_next_m = st.session_state.distancias_pasos[paso]
+                            st.info(f"📏 Distancia al siguiente paquete: **{d_next_m/1000:.2f} km** ({d_next_m:,.0f} m)")
+                        
+                        st.markdown(f"[🗺️ Navegar en Google Maps]({gmaps_url})")
+                        st.markdown("---")
             
-        folium.PolyLine(coords_ruta, color="red", weight=3, opacity=0.8).add_to(m)
-        st_folium(m, width=600, height=500, key="mapa_rutas_estados_gt")
+            if paquetes_pendientes == 0 and num_paquetes > 0:
+                st.balloons()
+                st.success("🎉 ¡Felicidades! Has completado la gestión de todas las entregas de la ruta.")
+
+        with col_mapa:
+            st.subheader("🗺️ Mapa de la Ruta")
+            puntos = st.session_state.puntos_ruta
+            m = folium.Map(location=[puntos[0]['lat'], puntos[0]['lon']], zoom_start=13)
+            
+            coords_ruta = []
+            for paso, idx in enumerate(st.session_state.secuencia_optima):
+                pt = puntos[idx]
+                coords_ruta.append([pt['lat'], pt['lon']])
+                
+                if paso == 0:
+                    color = "green"
+                else:
+                    est = st.session_state.estados_paquetes.get(pt['id'], "Pendiente ⏳")
+                    if "Entregado ✅" in est:
+                        color = "blue"
+                    elif "Ausente 👤" in est:
+                        color = "orange"
+                    elif "No Entregado ❌" in est:
+                        color = "red"
+                    else:
+                        color = "purple"
+
+                folium.Marker(
+                    [pt['lat'], pt['lon']], 
+                    popup=f"Parada {paso}: {pt['nombre']}<br>Tel: {pt['telefono_fmt']}<br>Estado: {st.session_state.estados_paquetes.get(pt.get('id'), 'Inicio')}",
+                    tooltip=f"Parada {paso}: [{pt['warehouse']}]",
+                    icon=folium.Icon(color=color, icon="info-sign")
+                ).add_to(m)
+                
+            folium.PolyLine(coords_ruta, color="red", weight=3, opacity=0.8).add_to(m)
+            st_folium(m, width=600, height=500, key="mapa_rutas_estados_gt")
+
+    # --- PESTAÑA HISTORIAL Y REPORTE ---
+    with tab_historial:
+        st.subheader("📋 Registro e Historial de Paquetes Procesados")
+        
+        historial_datos = []
+        for idx in st.session_state.secuencia_optima:
+            pt = st.session_state.puntos_ruta[idx]
+            if pt['id'] != 0:
+                est = st.session_state.estados_paquetes.get(pt['id'], "Pendiente ⏳")
+                historial_datos.append({
+                    'ID Paquete': pt['warehouse'],
+                    'Cliente': pt['nombre'],
+                    'Dirección': pt['direccion'],
+                    'Teléfono': pt['telefono_fmt'],
+                    'Estado Final': est
+                })
+        
+        df_historial = pd.DataFrame(historial_datos)
+        
+        # Filtros rápidos
+        st.dataframe(df_historial, use_container_width=True)
+        
+        # Opción para reactivar o cambiar de estado un paquete si hubo error
+        st.markdown("#### 🔄 Cambiar estado o reactivar pedido")
+        col_sel, col_est = st.columns([2, 1])
+        with col_sel:
+            pkt_reactivar = st.selectbox("Selecciona un paquete para modificar su estado:", options=[p['warehouse'] for p in st.session_state.puntos_cargados])
+        with col_est:
+            nuevo_est = st.selectbox("Nuevo Estado:", ["Pendiente ⏳", "Entregado ✅", "Ausente 👤", "No Entregado ❌"])
+            if st.button("Actualizar Estado"):
+                for p in st.session_state.puntos_cargados:
+                    if p['warehouse'] == pkt_reactivar:
+                        st.session_state.estados_paquetes[p['id']] = nuevo_est
+                        st.success(f"Estado de {pkt_reactivar} actualizado a {nuevo_est}")
+                        st.rerun()
