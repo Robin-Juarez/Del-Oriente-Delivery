@@ -1,0 +1,9 @@
+streamlit
+pandas
+requests
+folium
+streamlit-folium
+geopy
+ortools
+openpyxl
+pdfplumber
