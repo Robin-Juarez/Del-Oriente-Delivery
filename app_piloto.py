@@ -5,17 +5,26 @@ import folium
 import re
 import math
 from datetime import datetime, timedelta
+import zoneinfo
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
+import streamlit.components.v1 as components
 
-st.set_page_config(page_title="App Piloto - Métricas y Tiempos", layout="wide")
+st.set_page_config(page_title="App Piloto - Guatemala Delivery", layout="wide")
 
-st.title("🚚 Del Oriente Delivery - Navegación, Métricas y Tiempos")
+# --- ZONA HORARIA GUATEMALA ---
+TZ_GT = zoneinfo.ZoneInfo("America/Guatemala")
+hora_gt_actual = datetime.now(TZ_GT)
+
+st.title("🚚 Del Oriente Delivery - Control de Piloto")
+
+# Reloj con la hora actual de Guatemala
+st.markdown(f"### 🕒 Hora local en Guatemala: **{hora_gt_actual.strftime('%I:%M:%S %p')}**")
 
 OSRM_URL = "http://router.project-osrm.org/table/v1/driving"
-geolocator = Nominatim(user_agent="del_oriente_delivery_fast_v2", timeout=3)
+geolocator = Nominatim(user_agent="del_oriente_delivery_gt_v3", timeout=3)
 
 # --- ESTADOS DE SESIÓN ---
 if 'puntos_cargados' not in st.session_state:
@@ -28,27 +37,67 @@ if 'distancias_pasos' not in st.session_state:
     st.session_state.distancias_pasos = []
 if 'distancia_total_m' not in st.session_state:
     st.session_state.distancia_total_m = 0
+if 'estados_paquetes' not in st.session_state:
+    st.session_state.estados_paquetes = {}
 if 'gps_piloto' not in st.session_state:
     st.session_state.gps_piloto = {'lat': 14.5950, 'lon': -90.5120}
 
-# --- GEOCODIFICACIÓN RÁPIDA CON CACHÉ ---
+# --- GEOLOCALIZACIÓN DEL DISPOSITIVO MÓVIL (HTML5/JS) ---
+st.sidebar.header("📍 GPS del Dispositivo")
+
+gps_code = """
+<script>
+navigator.geolocation.getCurrentPosition(
+    (position) => {
+        const lat = position.coords.latitude;
+        const lon = position.coords.longitude;
+        window.parent.postMessage({
+            type: 'streamlit:setComponentValue',
+            value: {lat: lat, lon: lon}
+        }, '*');
+    },
+    (err) => { console.log("GPS no disponible o permiso denegado"); }
+);
+</script>
+"""
+coords_js = components.html(gps_code, height=0)
+
+c_lat = st.sidebar.number_input("Latitud Real GPS", value=st.session_state.gps_piloto['lat'], format="%.6f")
+c_lon = st.sidebar.number_input("Longitud Real GPS", value=st.session_state.gps_piloto['lon'], format="%.6f")
+st.session_state.gps_piloto = {'lat': c_lat, 'lon': c_lon}
+
+tiempo_entrega_min = st.sidebar.slider("Minutos promedio por entrega", min_value=1, max_value=20, value=5)
+velocidad_promedio_kmh = st.sidebar.slider("Velocidad promedio (km/h)", min_value=10, max_value=60, value=25)
+
+# --- FORMATEADOR DE TELÉFONOS DE GUATEMALA (+502 Y 8 DÍGITOS) ---
+def formatear_telefono_gt(telefono_raw):
+    digitos = re.sub(r'\D', '', str(telefono_raw))
+    
+    # Remover 502 si viene duplicado al inicio
+    if digitos.startswith('502') and len(digitos) > 8:
+        digitos = digitos[3:]
+        
+    # Obtener los últimos 8 dígitos válidos
+    if len(digitos) >= 8:
+        d8 = digitos[-8:]
+        return f"+502 {d8[:4]}-{d8[4:]}", f"+502{d8}"
+    
+    return str(telefono_raw), re.sub(r'\D', '', str(telefono_raw))
+
+# --- GEOCODIFICACIÓN CON CACHÉ ---
 @st.cache_data(show_spinner=False)
 def geocodificar_rapido(direccion_raw):
     dir_clean = str(direccion_raw).strip().lower()
-    
     zona_match = re.search(r'zona\s*(\d+)', dir_clean)
     zona_str = f"Zona {zona_match.group(1)}" if zona_match else "Zona 12"
-    
     via_match = re.search(r'(\d+\s*(?:avenida|calle|av|cll)|avenida\s*petapa|calzada\s*[a-z]+)', dir_clean)
     via_str = via_match.group(1) if via_match else ""
-    
     query = f"{via_str}, {zona_str}, Ciudad de Guatemala, Guatemala" if via_str else f"{dir_clean}, Guatemala"
     
     try:
         location = geolocator.geocode(query)
         if location:
             return location.latitude, location.longitude
-        
         loc_gen = geolocator.geocode(f"{zona_str}, Ciudad de Guatemala, Guatemala")
         if loc_gen:
             return loc_gen.latitude, loc_gen.longitude
@@ -59,7 +108,7 @@ def geocodificar_rapido(direccion_raw):
 
 def calcular_matriz_distancias_haversine(puntos):
     def haversine(lat1, lon1, lat2, lon2):
-        R = 6371000  # Metros
+        R = 6371000
         phi1, phi2 = math.radians(lat1), math.radians(lat2)
         dphi = math.radians(lat2 - lat1)
         dlambda = math.radians(lon2 - lon1)
@@ -78,7 +127,6 @@ def detectar_columnas_inteligente(df):
     mapa = {'warehouse': None, 'nombre': None, 'direccion': None, 'telefono': None}
     muestras = df.head(15)
     palabras_dir = ['zona', 'calle', 'avenida', 'av', 'cll', 'calzada', 'blvd', 'reformita', 'petapa', 'roosevelt']
-    
     puntuacion = {col: {'tel': 0, 'dir': 0, 'wh': 0, 'nom': 0} for col in df.columns}
 
     for col in df.columns:
@@ -96,7 +144,6 @@ def detectar_columnas_inteligente(df):
 
     mapa['telefono'] = max(puntuacion, key=lambda c: puntuacion[c]['tel']) if any(puntuacion[c]['tel'] > 0 for c in puntuacion) else df.columns[3]
     mapa['direccion'] = max(puntuacion, key=lambda c: puntuacion[c]['dir']) if any(puntuacion[c]['dir'] > 0 for c in puntuacion) else df.columns[2]
-    
     cols_restantes = [c for c in df.columns if c not in [mapa['telefono'], mapa['direccion']]]
     mapa['nombre'] = cols_restantes[1] if len(cols_restantes) > 1 else cols_restantes[0]
     mapa['warehouse'] = cols_restantes[0]
@@ -104,14 +151,6 @@ def detectar_columnas_inteligente(df):
     return mapa
 
 # ---------------- UI STREAMLIT ----------------
-st.sidebar.header("📍 Configuración del Piloto")
-c_lat = st.sidebar.number_input("Latitud GPS Piloto", value=st.session_state.gps_piloto['lat'], format="%.6f")
-c_lon = st.sidebar.number_input("Longitud GPS Piloto", value=st.session_state.gps_piloto['lon'], format="%.6f")
-st.session_state.gps_piloto = {'lat': c_lat, 'lon': c_lon}
-
-tiempo_entrega_min = st.sidebar.slider("Minutos promedio por entrega", min_value=1, max_value=20, value=5)
-velocidad_promedio_kmh = st.sidebar.slider("Velocidad promedio (km/h)", min_value=10, max_value=60, value=25)
-
 st.subheader("1. Cargar Archivo de Entregas")
 archivo = st.file_uploader("Selecciona archivo Excel (.xlsx, .xls)", type=["xlsx", "xls"])
 
@@ -134,12 +173,15 @@ if archivo:
         val_dir = str(row[mapa['direccion']]).strip() if pd.notna(row[mapa['direccion']]) else ''
         if not val_wh and not val_dir: continue
         
+        tel_fmt, tel_clean = formatear_telefono_gt(row[mapa['telefono']])
+        
         paquetes.append({
             'id': idx + 1,
             'warehouse': val_wh,
             'nombre': str(row[mapa['nombre']]).strip(),
             'direccion': val_dir,
-            'telefono': str(row[mapa['telefono']]).strip()
+            'telefono_fmt': tel_fmt,
+            'telefono_clean': tel_clean
         })
     st.session_state.puntos_cargados = paquetes
 
@@ -147,8 +189,8 @@ if st.session_state.puntos_cargados:
     st.write(f"### Se detectaron {len(st.session_state.puntos_cargados)} paquetes")
     st.dataframe(pd.DataFrame(st.session_state.puntos_cargados))
 
-    if st.button("🚀 Calcular Ruta, Métricas y Hora Estimada", type="primary"):
-        with st.spinner("Optimizando trayectos y tiempos..."):
+    if st.button("🚀 Calcular Ruta Exacta y Hora Estimada", type="primary"):
+        with st.spinner("Procesando GPS de piloto y ruta exacta..."):
             
             puntos_completos = [{
                 'id': 0,
@@ -166,10 +208,13 @@ if st.session_state.puntos_cargados:
                     'warehouse': pkt['warehouse'],
                     'nombre': pkt['nombre'],
                     'direccion': pkt['direccion'],
-                    'telefono': pkt['telefono'],
+                    'telefono_fmt': pkt['telefono_fmt'],
+                    'telefono_clean': pkt['telefono_clean'],
                     'lat': lat,
                     'lon': lon
                 })
+                if pkt['id'] not in st.session_state.estados_paquetes:
+                    st.session_state.estados_paquetes[pkt['id']] = "Pendiente ⏳"
             
             matriz_distancias = None
             try:
@@ -223,38 +268,33 @@ if st.session_state.puntos_cargados:
                 st.session_state.distancia_total_m = distancia_total
                 st.rerun()
 
-# --- MOSTRAR RESULTADOS Y NAVEGACIÓN ---
+# --- MOSTRAR RESULTADOS Y CONTROL DE PILOTO ---
 if st.session_state.secuencia_optima and st.session_state.puntos_ruta:
     st.markdown("---")
     
-    # --- CÁLCULOS DE MÉTRICAS GENERALES ---
     dist_total_km = st.session_state.distancia_total_m / 1000.0
     num_paquetes = len(st.session_state.secuencia_optima) - 1
     
-    # Tiempo de manejo (horas = km / km/h)
     horas_manejo = dist_total_km / velocidad_promedio_kmh
     minutos_manejo = horas_manejo * 60
-    
-    # Tiempo total de entregas (minutos por paquete)
     minutos_entregas = num_paquetes * tiempo_entrega_min
     minutos_totales = minutos_manejo + minutos_entregas
     
-    hora_actual = datetime.now()
-    hora_estimada_fin = hora_actual + timedelta(minutes=minutos_totales)
+    # Hora estimada de finalización basada en el momento de carga exacta de Guatemala
+    hora_estimada_fin = datetime.now(TZ_GT) + timedelta(minutes=minutos_totales)
     
-    # Tarjetas de Resumen
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Recorrido Total", f"{dist_total_km:.2f} km", f"{st.session_state.distancia_total_m:,.0f} m")
     m2.metric("Total Paquetes", f"{num_paquetes}")
-    m3.metric("Tiempo Estimado", f"{int(minutos_totales // 60)}h {int(minutos_totales % 60)}m")
-    m4.metric("Hora Estimada de Fin", hora_estimada_fin.strftime("%I:%M %p"))
+    m3.metric("Tiempo Estimado Total", f"{int(minutos_totales // 60)}h {int(minutos_totales % 60)}m")
+    m4.metric("Hora Est. de Fin (GT)", hora_estimada_fin.strftime("%I:%M %p"))
 
     st.markdown("---")
     
     col_lista, col_mapa = st.columns([1, 1])
     
     with col_lista:
-        st.subheader("📋 Orden de Entregas y Distancias por Paquete")
+        st.subheader("📋 Estado de Entregas y Gestión de Llamadas")
         for paso, idx in enumerate(st.session_state.secuencia_optima):
             pt = st.session_state.puntos_ruta[idx]
             
@@ -262,23 +302,43 @@ if st.session_state.secuencia_optima and st.session_state.puntos_ruta:
                 st.markdown(f"🚩 **Inicio (GPS Piloto):** Lat {pt['lat']}, Lon {pt['lon']}")
                 if len(st.session_state.distancias_pasos) > 0:
                     d_m = st.session_state.distancias_pasos[0]
-                    st.caption(f"➡️ Distancia a la primera entrega: **{d_m/1000:.2f} km** ({d_m:,.0f} metros)")
+                    st.caption(f"➡️ Distancia a primera entrega: **{d_m/1000:.2f} km** ({d_m:,.0f} m)")
                 st.markdown("---")
             else:
-                gmaps_url = f"https://www.google.com/maps/search/?api=1&query={pt['lat']},{pt['lon']}"
-                st.markdown(f"**Parada {paso:02d}:** [{pt['warehouse']}] **{pt['nombre']}**")
-                st.markdown(f"📍 {pt['direccion']} | 📞 {pt['telefono']}")
+                pkt_id = pt['id']
+                estado_actual = st.session_state.estados_paquetes.get(pkt_id, "Pendiente ⏳")
                 
-                # Distancia hacia el siguiente paquete (si aplica)
+                gmaps_url = f"https://www.google.com/maps/search/?api=1&query={pt['lat']},{pt['lon']}"
+                
+                st.markdown(f"**Parada {paso:02d}:** [{pt['warehouse']}] **{pt['nombre']}**")
+                st.markdown(f"📍 {pt['direccion']}")
+                st.markdown(f"📞 Teléfono: **{pt['telefono_fmt']}**")
+                st.markdown(f"**Estado Actual:** `{estado_actual}`")
+                
+                # Botón de llamada telefónica directa
+                st.markdown(f'<a href="tel:{pt["telefono_clean"]}" style="text-decoration:none;"><button style="background-color:#25D366;color:white;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;font-weight:bold;">📞 Llamar al Cliente ({pt["telefono_fmt"]})</button></a>', unsafe_allow_html=True)
+                
+                # Botones de cambio de estado
+                b1, b2, b3 = st.columns(3)
+                if b1.button("✅ Entregado", key=f"ent_{pkt_id}"):
+                    st.session_state.estados_paquetes[pkt_id] = "Entregado ✅"
+                    st.rerun()
+                if b2.button("👤 Ausente", key=f"aus_{pkt_id}"):
+                    st.session_state.estados_paquetes[pkt_id] = "Ausente 👤"
+                    st.rerun()
+                if b3.button("❌ No Entregado", key=f"noe_{pkt_id}"):
+                    st.session_state.estados_paquetes[pkt_id] = "No Entregado ❌"
+                    st.rerun()
+                
                 if paso < len(st.session_state.distancias_pasos):
                     d_next_m = st.session_state.distancias_pasos[paso]
-                    st.info(f"📏 Distancia hacia el siguiente paquete: **{d_next_m/1000:.2f} km** ({d_next_m:,.0f} m)")
+                    st.info(f"📏 Distancia al siguiente paquete: **{d_next_m/1000:.2f} km** ({d_next_m:,.0f} m)")
                 
                 st.markdown(f"[🗺️ Navegar en Google Maps]({gmaps_url})")
                 st.markdown("---")
                 
     with col_mapa:
-        st.subheader("🗺️ Mapa de la Ruta")
+        st.subheader("🗺️ Mapa de la Ruta y Estados")
         puntos = st.session_state.puntos_ruta
         m = folium.Map(location=[puntos[0]['lat'], puntos[0]['lon']], zoom_start=13)
         
@@ -286,13 +346,26 @@ if st.session_state.secuencia_optima and st.session_state.puntos_ruta:
         for paso, idx in enumerate(st.session_state.secuencia_optima):
             pt = puntos[idx]
             coords_ruta.append([pt['lat'], pt['lon']])
-            color = "green" if paso == 0 else "blue"
+            
+            if paso == 0:
+                color = "green"
+            else:
+                est = st.session_state.estados_paquetes.get(pt['id'], "Pendiente ⏳")
+                if "Entregado ✅" in est:
+                    color = "blue"
+                elif "Ausente 👤" in est:
+                    color = "orange"
+                elif "No Entregado ❌" in est:
+                    color = "red"
+                else:
+                    color = "purple"
+
             folium.Marker(
                 [pt['lat'], pt['lon']], 
-                popup=f"Parada {paso}: {pt['nombre']}<br>{pt['direccion']}",
+                popup=f"Parada {paso}: {pt['nombre']}<br>Tel: {pt['telefono_fmt']}<br>Estado: {st.session_state.estados_paquetes.get(pt.get('id'), 'Inicio')}",
                 tooltip=f"Parada {paso}: [{pt['warehouse']}]",
                 icon=folium.Icon(color=color, icon="info-sign")
             ).add_to(m)
             
         folium.PolyLine(coords_ruta, color="red", weight=3, opacity=0.8).add_to(m)
-        st_folium(m, width=600, height=500, key="mapa_rutas_metricas")
+        st_folium(m, width=600, height=500, key="mapa_rutas_estados_gt")
