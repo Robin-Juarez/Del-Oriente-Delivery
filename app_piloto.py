@@ -381,25 +381,44 @@ if st.session_state.secuencia_optima and st.session_state.puntos_ruta:
             folium.PolyLine(coords_ruta, color="red", weight=3, opacity=0.8).add_to(m)
             st_folium(m, width=600, height=500, key="mapa_rutas_estados_gt")
 
-    # --- PESTAÑA HISTORIAL Y REPORTE ---
+  # --- PESTAÑA HISTORIAL Y REPORTE ---
     with tab_historial:
         st.subheader("📋 Registro e Historial de Paquetes Procesados")
         
         historial_datos = []
         for idx in st.session_state.secuencia_optima:
             pt = st.session_state.puntos_ruta[idx]
-            if pt['id'] != 0:
+            # Omitir el punto de inicio del piloto
+            if pt.get('id', 0) != 0:
                 est = st.session_state.estados_paquetes.get(pt['id'], "Pendiente ⏳")
                 historial_datos.append({
-                    'ID Paquete': pt['warehouse'],
-                    'Cliente': pt['nombre'],
-                    'Dirección': pt['direccion'],
-                    'Teléfono': pt['telefono_fmt'],
+                    'ID Paquete': pt.get('warehouse', ''),
+                    'Cliente': pt.get('nombre', ''),
+                    'Dirección': pt.get('direccion', ''),
+                    'Teléfono': pt.get('telefono_fmt', 'N/A'),
                     'Estado Final': est
                 })
         
         df_historial = pd.DataFrame(historial_datos)
+        st.dataframe(df_historial, use_container_width=True)
         
+        # Opciones para modificar o reactivar
+        st.markdown("#### 🔄 Cambiar estado o reactivar pedido")
+        
+        lista_opciones = [p['warehouse'] for p in st.session_state.puntos_cargados if 'warehouse' in p]
+        
+        if lista_opciones:
+            col_sel, col_est = st.columns([2, 1])
+            with col_sel:
+                pkt_reactivar = st.selectbox("Selecciona un paquete para modificar su estado:", options=lista_opciones)
+            with col_est:
+                nuevo_est = st.selectbox("Nuevo Estado:", ["Pendiente ⏳", "Entregado ✅", "Ausente 👤", "No Entregado ❌"])
+                if st.button("Actualizar Estado"):
+                    for p in st.session_state.puntos_cargados:
+                        if p['warehouse'] == pkt_reactivar:
+                            st.session_state.estados_paquetes[p['id']] = nuevo_est
+                            st.success(f"Estado de {pkt_reactivar} actualizado a {nuevo_est}")
+                            st.rerun()
         # Filtros rápidos
         st.dataframe(df_historial, use_container_width=True)
         
