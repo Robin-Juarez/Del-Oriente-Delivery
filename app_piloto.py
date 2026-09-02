@@ -57,9 +57,13 @@ if 'direcciones_fallidas' not in st.session_state:
 # El código original usaba postMessage hacia window.parent, pero components.html()
 # no tiene un canal de retorno hacia Python: ese mensaje se perdía en el vacío y
 # los campos de Latitud/Longitud NUNCA se actualizaban solos. El piloto siempre
-# tenía que escribir sus coordenadas a mano.
-# Solución: pedimos el GPS por JS y, al obtenerlo, recargamos la página agregando
-# lat/lon como query params, que sí puede leer Streamlit con st.query_params.
+# --- BUG FIX #1 (mejorado): GEOLOCALIZACIÓN AUTOMÁTICA DEL DISPOSITIVO ---
+# Ahora se pide la ubicación real SOLA al cargar la página (sin que el piloto
+# tenga que tocar nada), y solo la primera vez por sesión: si la URL ya trae
+# lat/lon (porque ya se detectó antes), no se vuelve a disparar el GPS solo,
+# para no interrumpir ni recargar la página de nuevo sin necesidad. El botón
+# queda disponible por si el piloto se movió y quiere actualizar su posición
+# a mano.
 st.sidebar.header("📍 GPS del Dispositivo")
 
 qp = st.query_params
@@ -74,7 +78,7 @@ gps_html = """
   <button onclick="obtenerGPS()"
     style="padding:8px 14px;border-radius:6px;background:#25D366;color:white;
     border:none;cursor:pointer;font-weight:bold;width:100%;">
-    📍 Detectar mi ubicación GPS
+    📍 Actualizar mi ubicación GPS
   </button>
   <p id="estado_gps" style="font-size:12px;color:gray;margin-top:6px;"></p>
 </div>
@@ -95,6 +99,18 @@ function obtenerGPS() {
     }
   );
 }
+
+// Disparo automático: solo si la URL todavía NO trae lat/lon (primera carga
+// de la sesión). Así el piloto no tiene que hacer nada para que su ubicación
+// real se use como punto de partida.
+(function() {
+  const params = new URL(window.parent.location.href).searchParams;
+  if (!params.has('lat') || !params.has('lon')) {
+    obtenerGPS();
+  } else {
+    document.getElementById('estado_gps').innerText = 'Ubicación detectada ✅';
+  }
+})();
 </script>
 """
 components.html(gps_html, height=70)
@@ -105,6 +121,25 @@ st.session_state.gps_piloto = {'lat': c_lat, 'lon': c_lon}
 
 tiempo_entrega_min = st.sidebar.slider("Minutos promedio por entrega", min_value=1, max_value=20, value=5)
 velocidad_promedio_kmh = st.sidebar.slider("Velocidad promedio (km/h)", min_value=10, max_value=60, value=25)
+
+# --- AGRUPAR POR ZONA PARA UNA RUTA MÁS ÁGIL ---
+# Aunque el pin en el mapa no caiga exacto en la fachada, sí sabemos en qué
+# ZONA está cada entrega (viene en la dirección: "...zona 12..."). Esto se
+# usa para penalizar los tramos de la ruta que saltan de una zona a otra, de
+# modo que el optimizador prefiera terminar todas las entregas de una zona
+# antes de moverse a la siguiente, en vez de zigzaguear entre zonas lejanas.
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧭 Orden de ruta")
+peso_agrupar_zona_m = st.sidebar.slider(
+    "Agrupar entregas por zona (evitar zigzag)",
+    min_value=0, max_value=5000, value=1500, step=250,
+    help=(
+        "Metros de 'penalización' que se suman cada vez que la ruta pasa de "
+        "una zona a otra. En 0, el orden se basa solo en la distancia cruda "
+        "(puede saltar de zona en zona). Más alto = más probable que primero "
+        "termine todas las entregas de una zona antes de ir a la siguiente."
+    )
+)
 
 # --- GEOCODIFICACIÓN: Google (recomendado) con respaldo gratuito en OSM ---
 # OpenStreetMap/Nominatim (gratis) casi nunca tiene indexado el número de casa
@@ -253,6 +288,17 @@ def detectar_columnas_inteligente(df):
         mapa['warehouse'] = mapa['direccion']
 
     return mapa
+
+
+def extraer_zona(direccion_raw):
+    """
+    Extrae el número de zona de Guatemala desde el texto de la dirección
+    (ej. "...zona 12..." -> 12). Se usa para agrupar la ruta por zona y
+    evitar zigzag, sin depender de qué tan preciso haya quedado el pin en
+    el mapa.
+    """
+    m = re.search(r'zona\s*(\d+)', str(direccion_raw).lower())
+    return int(m.group(1)) if m else None
 
 
 def generar_id_estable(warehouse, nombre, direccion, telefono_clean):
@@ -484,7 +530,8 @@ if st.session_state.puntos_cargados:
                 'telefono_fmt': 'N/A',
                 'telefono_clean': '',
                 'lat': st.session_state.gps_piloto['lat'],
-                'lon': st.session_state.gps_piloto['lon']
+                'lon': st.session_state.gps_piloto['lon'],
+                'zona': None  # el punto de partida no tiene "zona" fija: puede conectar libre a la más cercana
             }]
 
             # OPTIMIZACIÓN DE VELOCIDAD: se geocodifica cada dirección ÚNICA solo
@@ -535,7 +582,8 @@ if st.session_state.puntos_cargados:
                     'telefono_fmt': pkt['telefono_fmt'],
                     'telefono_clean': pkt['telefono_clean'],
                     'lat': lat,
-                    'lon': lon
+                    'lon': lon,
+                    'zona': extraer_zona(pkt['direccion'])
                 })
                 if pkt['id'] not in st.session_state.estados_paquetes:
                     st.session_state.estados_paquetes[pkt['id']] = "Pendiente ⏳"
@@ -555,11 +603,27 @@ if st.session_state.puntos_cargados:
             if not matriz_distancias:
                 matriz_distancias = calcular_matriz_distancias_haversine(puntos_completos)
 
+            # --- AGRUPAR POR ZONA: se arma una matriz de COSTO aparte (con
+            # penalización por cruce de zona) que solo usa el optimizador para
+            # decidir el ORDEN de la ruta. La matriz de distancias real
+            # (matriz_distancias) se deja intacta para que los km y el tiempo
+            # estimado que ve el piloto sigan siendo la distancia real, no la
+            # distancia + penalización artificial.
+            matriz_costo = matriz_distancias
+            if peso_agrupar_zona_m > 0:
+                zonas = [p.get('zona') for p in puntos_completos]
+                n_pts = len(puntos_completos)
+                matriz_costo = [fila[:] for fila in matriz_distancias]
+                for i in range(n_pts):
+                    for j in range(n_pts):
+                        if i != j and zonas[i] is not None and zonas[j] is not None and zonas[i] != zonas[j]:
+                            matriz_costo[i][j] += peso_agrupar_zona_m
+
             manager = pywrapcp.RoutingIndexManager(len(puntos_completos), 1, 0)
             routing = pywrapcp.RoutingModel(manager)
 
             def distance_callback(from_index, to_index):
-                return int(matriz_distancias[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
+                return int(matriz_costo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
 
             transit_callback_index = routing.RegisterTransitCallback(distance_callback)
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
