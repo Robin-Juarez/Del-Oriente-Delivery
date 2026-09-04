@@ -7,6 +7,7 @@ import math
 import hashlib
 import io
 import concurrent.futures
+import urllib.parse
 import pdfplumber
 from datetime import datetime, timedelta
 import zoneinfo
@@ -714,10 +715,15 @@ if st.session_state.secuencia_optima and st.session_state.puntos_ruta:
 
                     if estado_actual == "Pendiente ⏳":
                         paquetes_pendientes += 1
-                        gmaps_url = f"https://www.google.com/maps/search/?api=1&query={pt['lat']},{pt['lon']}"
+                        # El link usa la DIRECCIÓN TAL CUAL fue ingresada (no las
+                        # coordenadas geocodificadas), para que Google Maps la
+                        # busque exactamente como viene en el Excel/PDF.
+                        gmaps_url = "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(
+                            f"{pt['direccion']}, Ciudad de Guatemala, Guatemala"
+                        )
 
                         st.markdown(f"**Parada {paso:02d}:** [{pt['warehouse']}] **{pt['nombre']}**")
-                        st.markdown(f"📍 {pt['direccion']}")
+                        st.markdown(f"📍 [{pt['direccion']}]({gmaps_url})")
                         st.markdown(f"📞 Teléfono: **{pt['telefono_fmt']}**")
 
                         st.markdown(f'<a href="tel:{pt["telefono_clean"]}" style="text-decoration:none;"><button style="background-color:#25D366;color:white;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;font-weight:bold;">📞 Llamar al Cliente ({pt["telefono_fmt"]})</button></a>', unsafe_allow_html=True)
@@ -737,7 +743,7 @@ if st.session_state.secuencia_optima and st.session_state.puntos_ruta:
                             d_next_m = st.session_state.distancias_pasos[paso]
                             st.info(f"📏 Distancia al siguiente paquete: **{d_next_m/1000:.2f} km** ({d_next_m:,.0f} m)")
 
-                        st.markdown(f"[🗺️ Navegar en Google Maps]({gmaps_url})")
+                        st.markdown(f"[🗺️ Navegar en Google Maps (dirección exacta)]({gmaps_url})")
                         st.markdown("---")
 
             if paquetes_pendientes == 0 and num_paquetes > 0:
